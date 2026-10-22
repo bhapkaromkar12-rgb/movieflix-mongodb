@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#090b10" />
+  <title>MovieFlix — Find your next favourite</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="ambient ambient-one"></div><div class="ambient ambient-two"></div>
+  <header class="topbar">
+    <a class="brand" href="#"><span class="brand-mark">M</span><span>MOVIE<span class="brand-light">FLIX</span></span></a>
+    <nav class="nav-links"><a class="active" href="#home">Discover</a><a href="#movies">Movies</a><a href="#how">How it works</a></nav>
+    <div class="top-actions"><span class="status-dot"></span><span id="dbStatus">Connecting</span><a class="account-link" href="/auth.html">Login / Register</a><a class="account-link admin-link" href="/auth.html?mode=admin">Admin</a></div>
+  </header>
+
+  <main>
+    <section class="hero" id="home">
+      <div class="hero-copy">
+        <div class="eyebrow"><span class="sparkle">✦</span> YOUR PERSONAL MOVIE UNIVERSE</div>
+        <h1>Every mood has<br> a <span>movie.</span></h1>
+        <p class="hero-description">Discover stories you'll love. Explore hand-picked films, find hidden gems, and let your next movie night begin here.</p>
+        <div class="hero-actions"><a class="primary-btn" href="#movies">Explore movies <span>↗</span></a><a class="text-btn" href="#how"><span class="play-icon">▶</span> How it works</a></div>
+        <div class="hero-stats"><div><strong>01<span>K+</span></strong><small>Stories to discover</small></div><i></i><div><strong>4.8<span>/5</span></strong><small>Community rating</small></div><i></i><div><strong>∞</strong><small>Movie-night moods</small></div></div>
+      </div>
+      <div class="hero-art" aria-label="Featured movie posters">
+        <div class="poster-back poster-left"><img src="https://image.tmdb.org/t/p/w500/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg" alt="Inception poster"></div>
+        <div class="poster-back poster-right"><img src="https://image.tmdb.org/t/p/w500/qJ2tW6WMUDux911r6m7haRef0WH.jpg" alt="The Dark Knight poster"></div>
+        <div class="poster-main"><img src="https://image.tmdb.org/t/p/w500/gEU2QniE6E77NI6lCU6MxlNBvIx.jpg" alt="Interstellar poster"><div class="poster-shade"></div><div class="featured-label">EDITOR'S PICK</div><div class="featured-info"><span class="pill">SCI-FI · 2014</span><h3>Interstellar</h3><div class="featured-rating">★ <b>4.8</b><span>· A journey beyond</span></div></div></div>
+        <div class="floating-note"><span class="note-star">★</span><div><b>Worth your time</b><small>Stories that stay with you.</small></div></div>
+      </div>
+      <div class="hero-bottom"><span>SCROLL TO DISCOVER</span><span class="scroll-line"></span><span>01 / 04</span></div>
+    </section>
+
+    <section class="catalog section-wrap" id="movies">
+      <div class="section-heading"><div><div class="eyebrow">THE COLLECTION</div><h2>Find your <span>next favourite.</span></h2><p class="muted">A little inspiration for your next movie night.</p></div><div class="search-wrap"><span>⌕</span><input id="searchInput" type="search" placeholder="Search titles, genres..." aria-label="Search movies"><kbd>⌘ K</kbd></div></div>
+      <div class="toolbar"><div class="genre-list" id="genreFilters"><button class="genre-chip selected" data-genre="All">All movies</button><button class="genre-chip" data-genre="Action">Action</button><button class="genre-chip" data-genre="Comedy">Comedy</button><button class="genre-chip" data-genre="Drama">Drama</button><button class="genre-chip" data-genre="Sci-Fi">Sci-Fi</button><button class="genre-chip" data-genre="Thriller">Thriller</button><button class="genre-chip" data-genre="Animation">Animation</button></div><select id="sortSelect" aria-label="Sort movies"><option value="recommended">✦ Recommended</option><option value="rating">Top rated</option><option value="year">Newest first</option></select></div>
+      <div class="results-line"><span id="resultCount">Finding movies for you...</span><span class="live-label"><i></i> CURATED FOR YOU</span></div>
+      <div class="movie-grid" id="movieGrid"><div class="loading-card">Loading your movie universe…</div></div>
+      <div class="empty-state" id="emptyState" hidden><span>⌕</span><h3>No movies found</h3><p>Try another title or choose a different genre.</p><button class="primary-btn" id="resetFilters">Clear filters ↗</button></div>
+    </section>
+
+    <section class="quote-section section-wrap" id="how"><div class="quote-mark">“</div><div><div class="eyebrow">MORE THAN A WATCHLIST</div><h2>Less scrolling.<br><span>More unforgettable stories.</span></h2><p class="muted">Search by title, explore by genre, sort by rating, and discover something worth watching.</p></div><div class="quote-side"><span class="mini-poster"><img src="https://image.tmdb.org/t/p/w200/66A9MqXOyVFCssoloscw79z8Tew.jpg" alt="3 Idiots poster"></span><span class="mini-poster"><img src="https://image.tmdb.org/t/p/w200/iiZZdoQBEYBv6id8su7ImL0oCbD.jpg" alt="Spider-Verse poster"></span><span class="mini-poster"><img src="https://image.tmdb.org/t/p/w200/whEM7qjV3e2jW9b6n7f4lV4v1rK.jpg" alt="Dangal poster"></span></div></section>
+  </main>
+  <footer><a class="brand" href="#"><span class="brand-mark">M</span><span>MOVIE<span class="brand-light">FLIX</span></span></a><span>Made for people who love a good story.</span><span>© 2026 MovieFlix · MongoDB project</span></footer>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="app.js"></script>
+</body>
+</html>
