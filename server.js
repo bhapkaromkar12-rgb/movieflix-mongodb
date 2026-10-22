@@ -1,59 +1,76 @@
 
 require("dotenv").config();
 
-
-
-
-
 const express = require("express");
 const mongoose = require("mongoose");
 const path = require("path");
 const crypto = require("crypto");
 const fs = require("fs");
 const multer = require("multer");
-
 const dns = require("node:dns");
 
+// Keep this for environments where the default DNS resolver has issues.
 dns.setServers(["1.1.1.1", "8.8.8.8"]);
+
 const app = express();
 const PORT = process.env.PORT || 5000;
+const IS_VERCEL = Boolean(process.env.VERCEL);
+const publicDir = path.join(__dirname, "public");
 
 app.use(express.json({ limit: "1mb" }));
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+
+// Serve frontend assets from public/.
+app.use(express.static(publicDir));
 
 // =====================================================
-// TRAILER UPLOAD CONFIGURATION
+// TRAILER UPLOAD
+// Local development supports disk uploads.
+// Vercel production temporarily disables local uploads.
+// Use cloud object storage for permanent production uploads.
 // =====================================================
 
 const trailerDir = path.join(__dirname, "public", "uploads", "trailers");
-fs.mkdirSync(trailerDir, { recursive: true });
 
-const trailerStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, trailerDir),
+// Vercel deployment filesystem par upload directory create mat karo.
+if (!process.env.VERCEL) {
+  fs.mkdirSync(trailerDir, { recursive: true });
+}
 
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    cb(null, `${Date.now()}-${crypto.randomBytes(6).toString("hex")}${ext}`);
-  }
-});
-
-const trailerUpload = multer({
-  storage: trailerStorage,
+const localTrailerUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, trailerDir),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase();
+      cb(
+        null,
+        `${Date.now()}-${crypto.randomBytes(6).toString("hex")}${ext}`
+      );
+    }
+  }),
   limits: { fileSize: 100 * 1024 * 1024 },
-
   fileFilter: (_req, file, cb) => {
     if (/^video\/(mp4|webm|ogg|quicktime|x-msvideo)$/.test(file.mimetype)) {
       return cb(null, true);
     }
-
     cb(new Error("Please upload a video file (MP4, WebM, OGG, MOV or AVI)."));
   }
 });
 
-// =====================================================
-// MOVIE MODEL
-// IMPORTANT: Explicitly use the MongoDB "movies" collection
-// =====================================================
+// Never write uploaded files to the Vercel deployment filesystem.
+const trailerUpload = IS_VERCEL
+  ? (req, res, next) => {
+      if (req.headers["content-type"]?.includes("multipart/form-data")) {
+        return res.status(501).json({
+          error:
+            "Trailer file uploads are not enabled on Vercel yet. " +
+            "Use a hosted trailer URL until cloud storage is configured."
+        });
+      }
+      next();
+    }
+  : localTrailerUpload.single("trailerFile");
+
 
 const movieSchema = new mongoose.Schema({
   title: { type: String, required: true, trim: true },
@@ -71,12 +88,10 @@ const movieSchema = new mongoose.Schema({
 
 movieSchema.index({ title: "text", genre: 1 });
 
-// Explicit collection name prevents Mongoose from choosing another collection.
 const Movie = mongoose.model("Movie", movieSchema, "movies");
 
 // =====================================================
-// DEMO MOVIES
-// Shown ONLY when MongoDB is disconnected.
+// DEMO MOVIES — used only when MongoDB is disconnected
 // =====================================================
 
 const demoMovies = [
@@ -168,7 +183,13 @@ const demoMovies = [
 
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true, maxlength: 80 },
-  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+    lowercase: true,
+    trim: true
+  },
   passwordHash: { type: String, required: true },
   role: { type: String, enum: ["user"], default: "user" },
   createdAt: { type: Date, default: Date.now }
@@ -203,7 +224,6 @@ function signToken(payload) {
 function verifyToken(token) {
   try {
     const [body, signature] = String(token || "").split(".");
-
     if (!body || !signature) return null;
 
     const expected = crypto
@@ -231,7 +251,11 @@ function verifyToken(token) {
 }
 
 function requireAuth(req, res, next) {
-  const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  const token = (req.headers.authorization || "").replace(
+    /^Bearer\s+/i,
+    ""
+  );
+
   const payload = verifyToken(token);
 
   if (!payload) {
@@ -247,13 +271,14 @@ function requireAdmin(req, res, next) {
     if (req.auth.role !== "admin") {
       return res.status(403).json({ error: "Admin access required." });
     }
-
     next();
   });
 }
 
-
-function passwordHash(password, salt = crypto.randomBytes(16).toString("hex")) {
+function passwordHash(
+  password,
+  salt = crypto.randomBytes(16).toString("hex")
+) {
   const hash = crypto.scryptSync(password, salt, 64).toString("hex");
   return `${salt}:${hash}`;
 }
@@ -261,6 +286,8 @@ function passwordHash(password, salt = crypto.randomBytes(16).toString("hex")) {
 function passwordMatches(password, stored) {
   try {
     const [salt, hash] = stored.split(":");
+    if (!salt || !hash) return false;
+
     const expected = Buffer.from(hash, "hex");
     const actual = crypto.scryptSync(password, salt, 64);
 
@@ -445,7 +472,7 @@ app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     database:
-      mongoose.connection.readyState === 1 ? "connected" : "demo mode",
+      mongoose.connection.readyState === 1 ? "connected" : "disconnected",
     databaseName: mongoose.connection.name || null,
     moviesCollection: Movie.collection.name
   });
@@ -453,8 +480,6 @@ app.get("/api/health", (req, res) => {
 
 // =====================================================
 // GET MOVIES
-// FIXED: Return real MongoDB records when connected.
-// Never substitute demo movies for an empty collection.
 // =====================================================
 
 app.get("/api/movies", async (req, res) => {
@@ -465,7 +490,6 @@ app.get("/api/movies", async (req, res) => {
       sort = "recommended"
     } = req.query;
 
-    // Use demo movies only if MongoDB is disconnected.
     if (mongoose.connection.readyState !== 1) {
       let result = demoMovies.filter((movie) => {
         const searchableText =
@@ -477,13 +501,8 @@ app.get("/api/movies", async (req, res) => {
         );
       });
 
-      if (sort === "rating") {
-        result.sort((a, b) => b.rating - a.rating);
-      }
-
-      if (sort === "year") {
-        result.sort((a, b) => b.year - a.year);
-      }
+      if (sort === "rating") result.sort((a, b) => b.rating - a.rating);
+      if (sort === "year") result.sort((a, b) => b.year - a.year);
 
       return res.json(result);
     }
@@ -517,19 +536,14 @@ app.get("/api/movies", async (req, res) => {
 
     const movies = await query.limit(100).lean();
 
-    // Debug output: check the actual database and collection.
     console.log("MongoDB database:", mongoose.connection.name);
     console.log("MongoDB collection:", Movie.collection.name);
     console.log("Movies found:", movies.length);
 
-    // IMPORTANT: No demo fallback when MongoDB is connected.
-    return res.json(movies);
+    res.json(movies);
   } catch (err) {
     console.error("GET /api/movies error:", err);
-
-    res.status(500).json({
-      error: "Could not load movies."
-    });
+    res.status(500).json({ error: "Could not load movies." });
   }
 });
 
@@ -540,7 +554,7 @@ app.get("/api/movies", async (req, res) => {
 app.post(
   "/api/movies",
   requireAdmin,
-  trailerUpload.single("trailerFile"),
+  trailerUpload,
   async (req, res) => {
     if (mongoose.connection.readyState !== 1) {
       return res.status(503).json({
@@ -568,6 +582,7 @@ app.post(
         });
       }
 
+      // Local upload is supported only outside Vercel.
       const savedTrailerUrl = req.file
         ? `/uploads/trailers/${req.file.filename}`
         : String(trailerUrl || "").trim();
@@ -588,7 +603,6 @@ app.post(
       res.status(201).json(movie);
     } catch (err) {
       console.error("Add movie error:", err);
-
       res.status(400).json({
         error: err.message || "Invalid movie details."
       });
@@ -623,17 +637,15 @@ app.patch("/api/movies/:id/rating", requireAuth, async (req, res) => {
     );
 
     if (!movie) {
-      return res.status(404).json({
-        error: "Movie not found."
-      });
+      return res.status(404).json({ error: "Movie not found." });
     }
 
     res.json(movie);
   } catch (err) {
     console.error("Update rating error:", err);
-
     res.status(400).json({
-      error: "Could not update rating. Demo cards cannot be rated until movies are stored in MongoDB."
+      error:
+        "Could not update rating. Demo cards cannot be rated until movies are stored in MongoDB."
     });
   }
 });
@@ -658,17 +670,42 @@ app.use((err, req, res, next) => {
 
   console.error("Unhandled server error:", err);
 
+  if (res.headersSent) return next(err);
+
   res.status(500).json({
     error: "An unexpected server error occurred."
   });
 });
 
 // =====================================================
-// FRONTEND FALLBACK
+// HOMEPAGE
+// Avoid a catch-all route that may mask missing files.
+// Static assets and existing HTML files are served by express.static.
 // =====================================================
 
-app.get("*", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+app.get("/", (req, res) => {
+  const indexPath = path.join(publicDir, "index.html");
+
+  res.sendFile(indexPath, (err) => {
+    if (err) {
+      console.error("Homepage file error:", err);
+      if (!res.headersSent) {
+        res.status(500).send("Homepage file could not be loaded.");
+      }
+    }
+  });
+});
+
+// =====================================================
+// NOT FOUND
+// =====================================================
+
+app.use((req, res) => {
+  if (req.path.startsWith("/api/")) {
+    return res.status(404).json({ error: "API endpoint not found." });
+  }
+
+  res.status(404).send("Page not found.");
 });
 
 // =====================================================
@@ -679,38 +716,47 @@ async function start() {
   if (process.env.MONGODB_URI) {
     try {
       await mongoose.connect(process.env.MONGODB_URI, {
-        serverSelectionTimeoutMS: 5000
+        serverSelectionTimeoutMS: 10000
       });
 
-      console.log("✅ MongoDB connected");
-      console.log("📂 Database:", mongoose.connection.name);
-      console.log("🎬 Movies collection:", Movie.collection.name);
-
-      // Check collection count during startup.
-      const movieCount = await Movie.countDocuments();
-      console.log("🍿 Movies stored in database:", movieCount);
+      console.log("MongoDB connected");
+      console.log("Database:", mongoose.connection.name);
+      console.log("Movies collection:", Movie.collection.name);
+      console.log("Movies stored:", await Movie.countDocuments());
     } catch (err) {
-  console.error("⚠️ MongoDB connection failed:", err.message);
-  console.error("Error name:", err.name);
+      console.error("MongoDB connection failed:", err.message);
+      console.error("Error name:", err.name);
 
-  if (err.reason?.servers) {
-    for (const [address, server] of err.reason.servers) {
-      console.error("Server:", address);
-      console.error("Server error:", server.error?.message || "No specific error");
+      if (err.reason?.servers) {
+        for (const [address, server] of err.reason.servers) {
+          console.error("MongoDB server:", address);
+          console.error(
+            "Server error:",
+            server.error?.message || "No specific error"
+          );
+        }
+      }
+
+      console.error("Server is starting without MongoDB.");
     }
-  }
-
-  console.log("⚠️ Starting server in demo mode.");
-}
   } else {
-    console.log(
-      "ℹ️ MONGODB_URI not set; starting in demo mode. Add it to .env to enable database features."
-    );
+    console.warn("MONGODB_URI is not set.");
   }
 
-  app.listen(PORT, () => {
-    console.log(`🎬 MovieFlix running at http://localhost:${PORT}`);
-  });
+  // Vercel manages the HTTP server for its deployment.
+  // For local development, start listening on PORT.
+  if (!IS_VERCEL) {
+    app.listen(PORT, () => {
+      console.log(`MovieFlix running at http://localhost:${PORT}`);
+    });
+  }
 }
 
-start();
+// Export the Express app for Vercel's serverless runtime.
+module.exports = app;
+
+// Start the connection for both local and Vercel deployments.
+start().catch((err) => {
+  console.error("Application startup error:", err);
+  if (!IS_VERCEL) process.exitCode = 1;
+});
