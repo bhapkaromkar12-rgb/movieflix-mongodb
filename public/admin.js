@@ -9,7 +9,7 @@ async function refreshMovies() {
     const response = await fetch("/api/movies?sort=year");
     const movies = await response.json();
     if (!response.ok) throw new Error(movies.error || "Could not load movies.");
-    $("adminMovieList").innerHTML = movies.filter(m => !String(m._id).startsWith("demo")).map(m => `<div class="admin-movie-row"><div><strong>${escapeHTML(m.title)}</strong><small>${escapeHTML(m.year || "Year unknown")} · ${escapeHTML(m.genre || "Movie")}</small></div><span>★ ${Number(m.rating || 0).toFixed(1)}</span></div>`).join("") || '<p class="muted-text">No database movies yet. Publish your first movie.</p>';
+    $("adminMovieList").innerHTML = movies.filter(m => !String(m._id).startsWith("demo")).map(m => `<div class="admin-movie-row"><div><strong>${escapeHTML(m.title)}</strong><small>${escapeHTML(m.year || "Year unknown")} · ${escapeHTML(m.genre || "Movie")}</small><small>${m.downloadAvailable ? `Licensed download · ${escapeHTML(new Intl.NumberFormat(undefined,{style:"currency",currency:String(m.downloadCurrency||"usd").toUpperCase()}).format(Number(m.downloadPriceCents||0)/(10**new Intl.NumberFormat(undefined,{style:"currency",currency:String(m.downloadCurrency||"usd").toUpperCase()}).resolvedOptions().maximumFractionDigits)))}` : "Catalog only"}</small></div><span>★ ${Number(m.rating || 0).toFixed(1)}</span></div>`).join("") || '<p class="muted-text">No database movies yet. Publish your first movie.</p>';
   } catch (error) { $("adminMovieList").textContent = error.message; }
 }
 function escapeHTML(value="") { return String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }

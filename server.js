@@ -7,24 +7,27 @@ const path = require("path");
 const crypto = require("crypto");
 const fs = require("fs");
 const multer = require("multer");
-const dns = require("node:dns");
+const Stripe = require("stripe");
+const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const IS_VERCEL = Boolean(process.env.VERCEL);
 const publicDir = path.join(__dirname, "public");
-
-// Keep the local DNS workaround out of Vercel's serverless runtime, which
-// manages DNS for function instances itself. If a local resolver rejects the
-// override, continue with the operating system's configured DNS servers.
-if (!IS_VERCEL) {
-  try {
-    dns.setServers(["1.1.1.1", "8.8.8.8"]);
-  } catch (err) {
-    console.warn("Could not configure custom DNS servers:", err.message);
-  }
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
+const paymentCurrency = String(process.env.STRIPE_CURRENCY || "usd").toLowerCase();
+function getAppBaseUrl() {
+  const configured = String(process.env.APP_BASE_URL || "").trim();
+  if (configured) return configured.replace(/\/$/, "");
+  if (IS_VERCEL && process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  return `http://localhost:${PORT}`;
 }
 
+// Stripe needs the unparsed request body to verify webhook signatures.
+app.use("/api/payments/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
@@ -66,18 +69,27 @@ const localTrailerUpload = multer({
   }
 });
 
-// Never write uploaded files to the Vercel deployment filesystem.
+// Vercel can parse admin form fields but must not persist uploads on its
+// ephemeral filesystem. A hosted trailer URL remains supported there.
+const vercelTrailerUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (/^video\/(mp4|webm|ogg|quicktime|x-msvideo)$/.test(file.mimetype)) return cb(null, true);
+    cb(new Error("Please upload a video file (MP4, WebM, OGG, MOV or AVI)."));
+  }
+}).single("trailerFile");
+
 const trailerUpload = IS_VERCEL
-  ? (req, res, next) => {
-      if (req.headers["content-type"]?.includes("multipart/form-data")) {
+  ? (req, res, next) => vercelTrailerUpload(req, res, (err) => {
+      if (err) return next(err);
+      if (req.file) {
         return res.status(501).json({
-          error:
-            "Trailer file uploads are not enabled on Vercel yet. " +
-            "Use a hosted trailer URL until cloud storage is configured."
+          error: "Trailer file upload storage is not configured on Vercel. Use a hosted trailer URL."
         });
       }
       next();
-    }
+    })
   : localTrailerUpload.single("trailerFile");
 
 
@@ -92,6 +104,10 @@ const movieSchema = new mongoose.Schema({
   director: { type: String, default: "" },
   cast: { type: String, default: "" },
   trailerUrl: { type: String, default: "" },
+  // Keep downloadable licensed media in a private object-storage bucket.
+  downloadKey: { type: String, default: "", select: false },
+  downloadPriceCents: { type: Number, default: 0, min: 0 },
+  downloadCurrency: { type: String, default: "usd", lowercase: true, trim: true },
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -200,11 +216,38 @@ const userSchema = new mongoose.Schema({
     trim: true
   },
   passwordHash: { type: String, required: true },
+  wishlist: [{ type: mongoose.Schema.Types.ObjectId, ref: "Movie" }],
   role: { type: String, enum: ["user"], default: "user" },
   createdAt: { type: Date, default: Date.now }
 });
 
 const User = mongoose.model("User", userSchema);
+
+const purchaseSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
+  movieId: { type: mongoose.Schema.Types.ObjectId, ref: "Movie", required: true, index: true },
+  stripeSessionId: { type: String, required: true, unique: true },
+  paymentIntentId: { type: String, default: "" },
+  amountCents: { type: Number, required: true, min: 1 },
+  currency: { type: String, required: true, lowercase: true },
+  purchasedAt: { type: Date, default: Date.now }
+});
+const Purchase = mongoose.model("Purchase", purchaseSchema);
+
+function publicMovie(movie) {
+  const result = movie.toObject ? movie.toObject() : { ...movie };
+  delete result.downloadKey;
+  result.downloadAvailable = Boolean(movie.downloadKey || movie.downloadAvailable);
+  result.downloadPriceCents = Number(movie.downloadPriceCents || 0);
+  result.downloadCurrency = String(movie.downloadCurrency || paymentCurrency).toLowerCase();
+  return result;
+}
+
+function validDownloadKey(key) {
+  return typeof key === "string" && key.length <= 500 &&
+    /^[A-Za-z0-9_./ -]+$/.test(key) && !key.startsWith("/") &&
+    !key.split("/").some((part) => part === ".." || part === ".");
+}
 
 // =====================================================
 // AUTHENTICATION HELPERS
@@ -474,6 +517,226 @@ app.get("/api/auth/me", requireAuth, (req, res) => {
 });
 
 // =====================================================
+// PAID DOWNLOADS, PURCHASE LIBRARY, AND WISHLIST
+// =====================================================
+
+const s3Bucket = String(process.env.S3_BUCKET || "").trim();
+let s3Client;
+function getS3Client() {
+  if (!s3Bucket || !process.env.AWS_REGION || !process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+    throw new Error("Private download storage is not configured.");
+  }
+  if (!s3Client) {
+    s3Client = new S3Client({
+      region: process.env.AWS_REGION,
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+      }
+    });
+  }
+  return s3Client;
+}
+
+async function recordPaidCheckout(session) {
+  if (mongoose.connection.readyState !== 1 || session.payment_status !== "paid" || session.mode !== "payment") return false;
+  const { userId, movieId, amountCents, currency } = session.metadata || {};
+  if (!mongoose.isValidObjectId(userId) || !mongoose.isValidObjectId(movieId)) return false;
+  const amount = Number(amountCents);
+  if (!Number.isSafeInteger(amount) || amount < 50 || amount !== Number(session.amount_total)) return false;
+  if (!currency || String(currency).toLowerCase() !== String(session.currency || "").toLowerCase()) return false;
+  const movie = await Movie.findById(movieId).select("downloadKey downloadPriceCents downloadCurrency");
+  if (!movie || !movie.downloadKey || movie.downloadPriceCents !== amount || movie.downloadCurrency !== String(currency).toLowerCase()) return false;
+
+  await Purchase.updateOne(
+    { stripeSessionId: session.id },
+    { $setOnInsert: {
+      userId,
+      movieId,
+      stripeSessionId: session.id,
+      paymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id || "",
+      amountCents: amount,
+      currency: String(currency).toLowerCase(),
+      purchasedAt: new Date((session.created || Math.floor(Date.now() / 1000)) * 1000)
+    } },
+    { upsert: true }
+  );
+  return true;
+}
+
+app.post("/api/payments/checkout", requireAuth, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Payments are not configured yet." });
+  if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: "MongoDB must be connected before checkout." });
+  if (req.auth.role !== "user" || !mongoose.isValidObjectId(req.auth.id)) return res.status(403).json({ error: "A customer account is required." });
+  if (!validMovieId(req.body.movieId)) return res.status(400).json({ error: "Choose a valid movie." });
+
+  try {
+    const movie = await Movie.findById(req.body.movieId).select("+downloadKey title downloadPriceCents downloadCurrency");
+    if (!movie || !movie.downloadKey) return res.status(404).json({ error: "This movie has no licensed download asset configured." });
+    if (!validDownloadKey(movie.downloadKey)) return res.status(409).json({ error: "The movie download asset is not configured safely." });
+    if (!Number.isInteger(movie.downloadPriceCents) || movie.downloadPriceCents < 50) return res.status(409).json({ error: "This movie does not have a valid download price." });
+    if (!/^[a-z]{3}$/.test(movie.downloadCurrency)) return res.status(409).json({ error: "This movie does not have a valid currency." });
+    const alreadyOwned = await Purchase.exists({ userId: req.auth.id, movieId: movie._id });
+    if (alreadyOwned) return res.status(409).json({ error: "You already own this movie. Open your library to download it.", owned: true });
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      client_reference_id: String(req.auth.id),
+      customer_email: req.auth.email,
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency: movie.downloadCurrency,
+          unit_amount: movie.downloadPriceCents,
+          product_data: { name: `${movie.title} — licensed digital download` }
+        }
+      }],
+      metadata: {
+        userId: String(req.auth.id),
+        movieId: String(movie._id),
+        amountCents: String(movie.downloadPriceCents),
+        currency: movie.downloadCurrency
+      },
+      success_url: `${getAppBaseUrl()}/account.html?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${getAppBaseUrl()}/#movies`
+    });
+    res.json({ checkoutUrl: session.url });
+  } catch (err) {
+    console.error("Create checkout error:", err.message);
+    res.status(502).json({ error: "Could not start checkout. Check the payment configuration and try again." });
+  }
+});
+
+app.post("/api/payments/webhook", async (req, res) => {
+  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+    return res.status(503).send("Payment webhook is not configured.");
+  }
+  if (mongoose.connection.readyState !== 1) {
+    return res.status(503).send("MongoDB is unavailable; retry the webhook later.");
+  }
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Invalid webhook signature: ${err.message}`);
+  }
+  try {
+    if (["checkout.session.completed", "checkout.session.async_payment_succeeded"].includes(event.type)) {
+      const recorded = await recordPaidCheckout(event.data.object);
+      if (!recorded) return res.status(400).send("Paid checkout could not be verified.");
+    }
+    res.json({ received: true });
+  } catch (err) {
+    console.error("Payment webhook processing error:", err.message);
+    res.status(500).send("Webhook processing failed.");
+  }
+});
+
+app.get("/api/payments/confirm/:sessionId", requireAuth, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Payments are not configured yet." });
+  if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: "MongoDB is not connected." });
+  try {
+    const session = await stripe.checkout.sessions.retrieve(req.params.sessionId);
+    if (session.metadata?.userId !== String(req.auth.id)) return res.status(404).json({ error: "Checkout session not found." });
+    if (session.payment_status === "paid") await recordPaidCheckout(session);
+    const purchase = await Purchase.findOne({ stripeSessionId: session.id, userId: req.auth.id }).lean();
+    res.json({ paid: Boolean(purchase), status: session.payment_status });
+  } catch (err) {
+    console.error("Confirm checkout error:", err.message);
+    res.status(400).json({ error: "Could not confirm this checkout." });
+  }
+});
+
+app.get("/api/account/library", requireAuth, async (req, res) => {
+  if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: "MongoDB is not connected." });
+  if (req.auth.role !== "user") return res.json([]);
+  try {
+    const purchases = await Purchase.find({ userId: req.auth.id })
+      .sort({ purchasedAt: -1 })
+      .populate({ path: "movieId", select: "title year genre rating poster language downloadPriceCents downloadCurrency" })
+      .lean();
+    res.json(purchases.filter((purchase) => purchase.movieId).map((purchase) => ({
+      id: String(purchase._id),
+      purchasedAt: purchase.purchasedAt,
+      amountCents: purchase.amountCents,
+      currency: purchase.currency,
+      movie: { ...purchase.movieId, _id: String(purchase.movieId._id) }
+    })));
+  } catch (err) {
+    console.error("Load account library error:", err.message);
+    res.status(500).json({ error: "Could not load your library." });
+  }
+});
+
+app.get("/api/account/wishlist", requireAuth, async (req, res) => {
+  if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: "MongoDB is not connected." });
+  if (req.auth.role !== "user") return res.json([]);
+  try {
+    const user = await User.findById(req.auth.id).populate({ path: "wishlist", select: "title year genre rating poster language" }).lean();
+    res.json((user?.wishlist || []).map((movie) => ({ ...movie, _id: String(movie._id) })));
+  } catch (err) {
+    console.error("Load wishlist error:", err.message);
+    res.status(500).json({ error: "Could not load your watchlist." });
+  }
+});
+
+app.post("/api/account/wishlist/:movieId", requireAuth, async (req, res) => {
+  if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: "MongoDB is not connected." });
+  if (req.auth.role !== "user") return res.status(403).json({ error: "A customer account is required." });
+  if (!validMovieId(req.params.movieId)) return res.status(400).json({ error: "Choose a valid movie." });
+  try {
+    const exists = await Movie.exists({ _id: req.params.movieId });
+    if (!exists) return res.status(404).json({ error: "Movie not found." });
+    await User.updateOne({ _id: req.auth.id }, { $addToSet: { wishlist: req.params.movieId } });
+    res.json({ saved: true });
+  } catch (err) {
+    console.error("Save wishlist item error:", err.message);
+    res.status(500).json({ error: "Could not save this movie." });
+  }
+});
+
+app.delete("/api/account/wishlist/:movieId", requireAuth, async (req, res) => {
+  if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: "MongoDB is not connected." });
+  if (req.auth.role !== "user") return res.status(403).json({ error: "A customer account is required." });
+  if (!validMovieId(req.params.movieId)) return res.status(400).json({ error: "Choose a valid movie." });
+  try {
+    await User.updateOne({ _id: req.auth.id }, { $pull: { wishlist: req.params.movieId } });
+    res.json({ saved: false });
+  } catch (err) {
+    console.error("Remove wishlist item error:", err.message);
+    res.status(500).json({ error: "Could not remove this movie." });
+  }
+});
+
+app.get("/api/movies/:movieId/download", requireAuth, async (req, res) => {
+  if (mongoose.connection.readyState !== 1) return res.status(503).json({ error: "MongoDB is not connected." });
+  if (req.auth.role !== "user") return res.status(403).json({ error: "A customer account is required." });
+  if (!validMovieId(req.params.movieId)) return res.status(400).json({ error: "Choose a valid movie." });
+  try {
+    const [movie, purchase] = await Promise.all([
+      Movie.findById(req.params.movieId).select("+downloadKey title"),
+      Purchase.findOne({ userId: req.auth.id, movieId: req.params.movieId }).lean()
+    ]);
+    if (!purchase) return res.status(403).json({ error: "Purchase this movie before downloading it." });
+    if (!movie || !validDownloadKey(movie.downloadKey)) return res.status(404).json({ error: "The licensed download file is unavailable." });
+    const client = getS3Client();
+    const extension = path.posix.extname(movie.downloadKey);
+    const fileBase = String(movie.title || "movie").replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || "movie";
+    const filename = `${fileBase}${extension}`;
+    const command = new GetObjectCommand({
+      Bucket: s3Bucket,
+      Key: movie.downloadKey,
+      ResponseContentDisposition: `attachment; filename="${filename}"`
+    });
+    const downloadUrl = await getSignedUrl(client, command, { expiresIn: 90 });
+    res.json({ downloadUrl, expiresIn: 90 });
+  } catch (err) {
+    console.error("Create secure download link error:", err.message);
+    res.status(503).json({ error: err.message === "Private download storage is not configured." ? err.message : "Could not prepare the download. Please try again." });
+  }
+});
+
+// =====================================================
 // DATABASE HEALTH CHECK
 // =====================================================
 
@@ -513,7 +776,7 @@ app.get("/api/movies", async (req, res) => {
       if (sort === "rating") result.sort((a, b) => b.rating - a.rating);
       if (sort === "year") result.sort((a, b) => b.year - a.year);
 
-      return res.json(result);
+      return res.json(result.map(publicMovie));
     }
 
     const filter = {};
@@ -543,13 +806,13 @@ app.get("/api/movies", async (req, res) => {
       query = query.sort({ createdAt: -1 });
     }
 
-    const movies = await query.limit(100).lean();
+    const movies = await query.select("+downloadKey").limit(100).lean();
 
     console.log("MongoDB database:", mongoose.connection.name);
     console.log("MongoDB collection:", Movie.collection.name);
     console.log("Movies found:", movies.length);
 
-    res.json(movies);
+    res.json(movies.map(publicMovie));
   } catch (err) {
     console.error("GET /api/movies error:", err);
     res.status(500).json({ error: "Could not load movies." });
@@ -582,13 +845,32 @@ app.post(
         language,
         director,
         cast,
-        trailerUrl
+        trailerUrl,
+        downloadPriceCents = 0,
+        downloadCurrency = paymentCurrency,
+        downloadKey = ""
       } = req.body;
 
       if (!String(title || "").trim()) {
         return res.status(400).json({
           error: "Movie title is required."
         });
+      }
+
+      const normalizedDownloadKey = String(downloadKey || "").trim();
+      const parsedDownloadPrice = Number(downloadPriceCents || 0);
+      const normalizedCurrency = String(downloadCurrency || paymentCurrency).toLowerCase();
+      if (normalizedDownloadKey && !validDownloadKey(normalizedDownloadKey)) {
+        return res.status(400).json({ error: "Use a valid private S3 object key without path traversal." });
+      }
+      if (normalizedDownloadKey && (!Number.isInteger(parsedDownloadPrice) || parsedDownloadPrice < 50)) {
+        return res.status(400).json({ error: "A downloadable movie must have a price of at least 50 minor currency units." });
+      }
+      if (!normalizedDownloadKey && parsedDownloadPrice !== 0) {
+        return res.status(400).json({ error: "Add a private download asset key or set the download price to zero." });
+      }
+      if (!/^[a-z]{3}$/.test(normalizedCurrency)) {
+        return res.status(400).json({ error: "Download currency must be a three-letter ISO code." });
       }
 
       // Local upload is supported only outside Vercel.
@@ -606,10 +888,13 @@ app.post(
         language,
         director,
         cast,
-        trailerUrl: savedTrailerUrl
+        trailerUrl: savedTrailerUrl,
+        downloadKey: normalizedDownloadKey,
+        downloadPriceCents: parsedDownloadPrice,
+        downloadCurrency: normalizedCurrency
       });
 
-      res.status(201).json(movie);
+      res.status(201).json(publicMovie(movie));
     } catch (err) {
       console.error("Add movie error:", err);
       res.status(400).json({
@@ -665,10 +950,11 @@ app.patch("/api/movies/:id/rating", requireAuth, async (req, res) => {
 
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
-    const message =
-      err.code === "LIMIT_FILE_SIZE"
-        ? "Trailer is too large. Maximum size is 100 MB."
-        : err.message;
+    const message = err.code === "LIMIT_FILE_SIZE"
+      ? (IS_VERCEL
+          ? "Trailer file uploads are not enabled on Vercel. Use a hosted trailer URL."
+          : "Trailer is too large. Maximum size is 100 MB.")
+      : err.message;
 
     return res.status(400).json({ error: message });
   }
@@ -731,7 +1017,6 @@ async function start() {
       console.log("MongoDB connected");
       console.log("Database:", mongoose.connection.name);
       console.log("Movies collection:", Movie.collection.name);
-      console.log("Movies stored:", await Movie.countDocuments());
     } catch (err) {
       console.error("MongoDB connection failed:", err.message);
       console.error("Error name:", err.name);

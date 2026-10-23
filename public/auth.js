@@ -1,6 +1,8 @@
 "use strict";
 const $ = id => document.getElementById(id);
 let mode = new URLSearchParams(location.search).get("mode") || "login";
+const requestedNext = new URLSearchParams(location.search).get("next") || "/";
+const safeNext = requestedNext.startsWith("/") && !requestedNext.startsWith("//") && !requestedNext.startsWith("/auth.html") ? requestedNext : "/";
 function setMode(next) {
   mode = next;
   $("nameWrap").hidden = mode !== "register";
@@ -29,7 +31,7 @@ $("authForm").addEventListener("submit", async event => {
     if (mode === "admin" && data.user.role !== "admin") throw new Error("This account is not an administrator.");
     localStorage.setItem("nextmovie_token", data.token);
     localStorage.setItem("nextmovie_user", JSON.stringify(data.user));
-    location.href = data.user.role === "admin" ? "/admin.html" : "/";
+    location.href = data.user.role === "admin" ? "/admin.html" : safeNext;
   } catch (error) { $("authMessage").textContent = error.message; }
   finally { button.disabled = false; }
 });

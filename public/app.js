@@ -9,6 +9,69 @@ const toast = document.getElementById("toast");
 let activeGenre = "All";
 let movies = [];
 let searchTimer;
+const accountState = { owned: new Set(), wishlist: new Set() };
+function authToken() { return localStorage.getItem("nextmovie_token") || ""; }
+function authHeaders(extra = {}) { return { ...extra, Authorization: `Bearer ${authToken()}` }; }
+function formatPrice(cents, currency = "usd") {
+  try {
+    const code = String(currency).toUpperCase();
+    const digits = new Intl.NumberFormat(undefined, { style: "currency", currency: code }).resolvedOptions().maximumFractionDigits;
+    return new Intl.NumberFormat(undefined, { style: "currency", currency: code }).format(Number(cents || 0) / (10 ** digits));
+  } catch { return `${Number(cents || 0)} ${String(currency).toUpperCase()}`; }
+}
+async function syncAccountState() {
+  const link = document.getElementById("accountLink");
+  if (!authToken()) { if (link) link.textContent = "Login / Register"; return; }
+  try {
+    const me = await fetch("/api/auth/me", { headers: authHeaders() });
+    if (!me.ok) throw new Error("Session expired");
+    const data = await me.json();
+    if (link) { link.textContent = `My Library · ${data.user.name}`; link.href = "/account.html"; }
+    const [libraryResponse, wishlistResponse] = await Promise.all([
+      fetch("/api/account/library", { headers: authHeaders() }),
+      fetch("/api/account/wishlist", { headers: authHeaders() })
+    ]);
+    if (libraryResponse.ok) accountState.owned = new Set((await libraryResponse.json()).map(item => String(item.movie._id)));
+    if (wishlistResponse.ok) accountState.wishlist = new Set((await wishlistResponse.json()).map(movie => String(movie._id)));
+  } catch {
+    localStorage.removeItem("nextmovie_token");
+    localStorage.removeItem("nextmovie_user");
+    if (link) { link.textContent = "Login / Register"; link.href = "/auth.html"; }
+  }
+}
+async function buyMovie(movieId) {
+  if (!authToken()) { location.href = `/auth.html?next=${encodeURIComponent("/#movies")}`; return; }
+  try {
+    const response = await fetch("/api/payments/checkout", { method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ movieId }) });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Could not start checkout.");
+    if (!data.checkoutUrl) throw new Error("Payment provider did not return a checkout link.");
+    location.assign(data.checkoutUrl);
+  } catch (error) { showToast(error.message); }
+}
+async function downloadMovie(movieId) {
+  if (!authToken()) { location.href = `/auth.html?next=${encodeURIComponent("/account.html")}`; return; }
+  try {
+    const response = await fetch(`/api/movies/${encodeURIComponent(movieId)}/download`, { headers: authHeaders() });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Download unavailable.");
+    location.assign(data.downloadUrl);
+  } catch (error) { showToast(error.message); }
+}
+async function toggleWishlist(movieId) {
+  if (!authToken()) { location.href = `/auth.html?next=${encodeURIComponent("/#movies")}`; return; }
+  const saved = accountState.wishlist.has(String(movieId));
+  try {
+    const response = await fetch(`/api/account/wishlist/${encodeURIComponent(movieId)}`, {
+      method: saved ? "DELETE" : "POST", headers: authHeaders()
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Could not update watchlist.");
+    if (saved) accountState.wishlist.delete(String(movieId)); else accountState.wishlist.add(String(movieId));
+    openMovieDetails(window.currentDetailMovie);
+    showToast(saved ? "Removed from your watchlist." : "Saved to your watchlist.");
+  } catch (error) { showToast(error.message); }
+}
 
 async function checkHealth() {
   try {
@@ -65,6 +128,12 @@ function openMovieDetails(movie) {
       if (e.target.closest("[data-detail-close]")) closeMovieDetails();
       if (e.target.closest(".detail-prev")) navigateDetail(-1);
       if (e.target.closest(".detail-next")) navigateDetail(1);
+      const buyButton = e.target.closest("[data-buy-movie]");
+      if (buyButton) buyMovie(buyButton.dataset.buyMovie);
+      const downloadButton = e.target.closest("[data-download-movie]");
+      if (downloadButton) downloadMovie(downloadButton.dataset.downloadMovie);
+      const wishlistButton = e.target.closest("[data-wishlist-movie]");
+      if (wishlistButton) toggleWishlist(wishlistButton.dataset.wishlistMovie);
       const playButton = e.target.closest("[data-play-trailer]");
       if (playButton) playMovieTrailer(playButton.dataset.playTrailer, window.currentDetailMovie);
       if (e.target.closest("[data-trailer-close]")) closeTrailerPlayer();
@@ -88,7 +157,8 @@ function openMovieDetails(movie) {
   hero.innerHTML = `<div class="detail-poster">${poster && poster !== "Not available" ? `<img src="${safeText(poster)}" alt="${safeText(title)} poster" onerror="this.style.display='none'">` : '<div class="detail-poster-placeholder">🎬</div>'}</div>
     <div class="detail-heading"><span class="detail-eyebrow">MOVIE DETAILS</span><h1>${safeText(title)}</h1><div class="detail-meta">${safeText(year)} <span>•</span> ${safeText(duration)} <span>•</span> ${safeText(language)}</div>
     <div class="detail-rating">★ <strong>${rating > 0 ? rating.toFixed(1) : "—"}</strong><span>/ 5 rating</span></div>
-    <button class="detail-play" type="button" data-play-trailer="${safeText(trailer && trailer !== "Not available" ? trailer : "")}">▶ Play Trailer</button></div>`;
+    <button class="detail-play" type="button" data-play-trailer="${safeText(trailer && trailer !== "Not available" ? trailer : "")}">▶ Play Trailer</button>
+    <div class="detail-purchase-actions">${movie.downloadAvailable ? (accountState.owned.has(String(movie._id)) ? `<button class="purchase-btn" type="button" data-download-movie="${safeText(movie._id)}">⬇ Download from library</button>` : `<button class="purchase-btn" type="button" data-buy-movie="${safeText(movie._id)}">Buy download · ${safeText(formatPrice(movie.downloadPriceCents, movie.downloadCurrency))}</button>`) : ""}<button class="watchlist-btn" type="button" data-wishlist-movie="${safeText(movie._id)}">${accountState.wishlist.has(String(movie._id)) ? "♥ Saved" : "♡ Watchlist"}</button></div><small class="license-note">${movie.downloadAvailable ? "Secure download for licensed media. Payment confirmation is required." : "No digital download is available for this title."}</small></div>`;
   document.getElementById("detailBody").innerHTML = `<h2>Synopsis</h2><p class="detail-description">${safeText(description)}</p>
     <div class="detail-info-grid"><div><span>GENRE</span><strong>${safeText(Array.isArray(genre) ? genre.join(", ") : genre)}</strong></div>
     <div><span>DIRECTOR</span><strong>${safeText(director)}</strong></div>
@@ -235,4 +305,5 @@ document.addEventListener("keydown", e => {
   }
 });
 checkHealth();
+syncAccountState();
 loadMovies();
