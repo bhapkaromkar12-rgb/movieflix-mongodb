@@ -32,7 +32,8 @@ app.use(express.static(publicDir));
 
 const trailerDir = path.join(__dirname, "public", "uploads", "trailers");
 
-// Vercel deployment filesystem par upload directory create mat karo.
+// Local computer par upload directory create karo.
+// Vercel par local filesystem mein upload folder create mat karo.
 if (!process.env.VERCEL) {
   fs.mkdirSync(trailerDir, { recursive: true });
 }
