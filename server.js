@@ -34,7 +34,7 @@ const trailerDir = path.join(__dirname, "public", "uploads", "trailers");
 
 // Local computer par upload directory create karo.
 // Vercel par local filesystem mein upload folder create mat karo.
-if (!process.env.VERCEL) {
+if (process.env.NODE_ENV !== "production" && !IS_VERCEL) {
   fs.mkdirSync(trailerDir, { recursive: true });
 }
 
