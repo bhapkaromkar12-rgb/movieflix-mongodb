@@ -9,13 +9,21 @@ const fs = require("fs");
 const multer = require("multer");
 const dns = require("node:dns");
 
-// Keep this for environments where the default DNS resolver has issues.
-dns.setServers(["1.1.1.1", "8.8.8.8"]);
-
 const app = express();
 const PORT = process.env.PORT || 5000;
 const IS_VERCEL = Boolean(process.env.VERCEL);
 const publicDir = path.join(__dirname, "public");
+
+// Keep the local DNS workaround out of Vercel's serverless runtime, which
+// manages DNS for function instances itself. If a local resolver rejects the
+// override, continue with the operating system's configured DNS servers.
+if (!IS_VERCEL) {
+  try {
+    dns.setServers(["1.1.1.1", "8.8.8.8"]);
+  } catch (err) {
+    console.warn("Could not configure custom DNS servers:", err.message);
+  }
+}
 
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
